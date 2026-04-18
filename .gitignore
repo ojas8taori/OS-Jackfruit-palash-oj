@@ -32,3 +32,6 @@ logs/
 *.swp
 *~
 .vscode/
+
+readme_report.md
+step-by-step-demo-plan.md
