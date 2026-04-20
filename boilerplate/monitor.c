@@ -39,6 +39,14 @@
  *   - remember whether the soft-limit warning was already emitted
  *   - include `struct list_head` linkage
  * ============================================================== */
+struct monitored_entry {
+    pid_t pid;
+    unsigned long soft_limit_bytes;
+    unsigned long hard_limit_bytes;
+    char container_id[MONITOR_NAME_LEN];
+    int soft_warned;
+    struct list_head link;
+};
 
 
 /* ==============================================================
@@ -51,6 +59,8 @@
  * You may choose either a mutex or a spinlock, but your README must
  * justify the choice in terms of the code paths you implemented.
  * ============================================================== */
+static LIST_HEAD(monitored_entries);
+static DEFINE_SPINLOCK(monitored_lock);
 
 
 /* --- Provided: internal device / timer state --- */
@@ -133,6 +143,11 @@ static void kill_process(const char *container_id,
  * --------------------------------------------------------------- */
 static void timer_callback(struct timer_list *t)
 {
+    struct monitored_entry *entry, *tmp;
+    unsigned long flags;
+
+    (void)t;
+
     /* ==============================================================
      * TODO 3: Implement periodic monitoring.
      *
@@ -143,6 +158,34 @@ static void timer_callback(struct timer_list *t)
      *   - enforce hard limit and then remove the entry
      *   - avoid use-after-free while deleting during iteration
      * ============================================================== */
+    spin_lock_irqsave(&monitored_lock, flags);
+    list_for_each_entry_safe(entry, tmp, &monitored_entries, link) {
+        long rss_bytes = get_rss_bytes(entry->pid);
+
+        if (rss_bytes < 0) {
+            list_del(&entry->link);
+            kfree(entry);
+            continue;
+        }
+
+        if (!entry->soft_warned && rss_bytes > (long)entry->soft_limit_bytes) {
+            entry->soft_warned = 1;
+            log_soft_limit_event(entry->container_id,
+                                 entry->pid,
+                                 entry->soft_limit_bytes,
+                                 rss_bytes);
+        }
+
+        if (rss_bytes > (long)entry->hard_limit_bytes) {
+            kill_process(entry->container_id,
+                         entry->pid,
+                         entry->hard_limit_bytes,
+                         rss_bytes);
+            list_del(&entry->link);
+            kfree(entry);
+        }
+    }
+    spin_unlock_irqrestore(&monitored_lock, flags);
 
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
@@ -157,6 +200,9 @@ static void timer_callback(struct timer_list *t)
 static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
     struct monitor_request req;
+    struct monitored_entry *entry;
+    struct monitored_entry *iter, *tmp;
+    unsigned long flags;
 
     (void)f;
 
@@ -165,6 +211,8 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
     if (copy_from_user(&req, (struct monitor_request __user *)arg, sizeof(req)))
         return -EFAULT;
+
+    req.container_id[MONITOR_NAME_LEN - 1] = '\0';
 
     if (cmd == MONITOR_REGISTER) {
         printk(KERN_INFO
@@ -179,6 +227,33 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
          *   - validate allocation and limits
          *   - insert into the shared list under the chosen lock
          * ============================================================== */
+
+        if (req.pid <= 0)
+            return -EINVAL;
+
+        if (req.hard_limit_bytes == 0 || req.soft_limit_bytes > req.hard_limit_bytes)
+            return -EINVAL;
+
+        entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+        if (!entry)
+            return -ENOMEM;
+
+        entry->pid = req.pid;
+        entry->soft_limit_bytes = req.soft_limit_bytes;
+        entry->hard_limit_bytes = req.hard_limit_bytes;
+        strscpy(entry->container_id, req.container_id, sizeof(entry->container_id));
+        entry->soft_warned = 0;
+
+        spin_lock_irqsave(&monitored_lock, flags);
+        list_for_each_entry_safe(iter, tmp, &monitored_entries, link) {
+            if (iter->pid == req.pid) {
+                list_del(&iter->link);
+                kfree(iter);
+                break;
+            }
+        }
+        list_add_tail(&entry->link, &monitored_entries);
+        spin_unlock_irqrestore(&monitored_lock, flags);
 
         return 0;
     }
@@ -195,6 +270,18 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
      *   - remove the matching entry safely if found
      *   - return status indicating whether a matching entry was removed
      * ============================================================== */
+
+    spin_lock_irqsave(&monitored_lock, flags);
+    list_for_each_entry_safe(iter, tmp, &monitored_entries, link) {
+        if (iter->pid == req.pid ||
+            strncmp(iter->container_id, req.container_id, sizeof(iter->container_id)) == 0) {
+            list_del(&iter->link);
+            kfree(iter);
+            spin_unlock_irqrestore(&monitored_lock, flags);
+            return 0;
+        }
+    }
+    spin_unlock_irqrestore(&monitored_lock, flags);
 
     return -ENOENT;
 }
@@ -245,6 +332,9 @@ static int __init monitor_init(void)
 /* --- Provided: Module Exit --- */
 static void __exit monitor_exit(void)
 {
+    struct monitored_entry *entry, *tmp;
+    unsigned long flags;
+
     del_timer_sync(&monitor_timer);
 
     /* ==============================================================
@@ -254,6 +344,13 @@ static void __exit monitor_exit(void)
      *   - remove and free every list node safely
      *   - leave no leaked state on module unload
      * ============================================================== */
+
+    spin_lock_irqsave(&monitored_lock, flags);
+    list_for_each_entry_safe(entry, tmp, &monitored_entries, link) {
+        list_del(&entry->link);
+        kfree(entry);
+    }
+    spin_unlock_irqrestore(&monitored_lock, flags);
 
     cdev_del(&c_dev);
     device_destroy(cl, dev_num);
