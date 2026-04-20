@@ -29,7 +29,8 @@ make ci
 ```
 
 Copy latest workloads into both rootfs copies:
-
+ hello 
+ 
 ```bash
 cp ./cpu_hog ./rootfs-alpha/
 cp ./cpu_hog ./rootfs-beta/
