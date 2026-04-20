@@ -335,15 +335,13 @@ static void __exit monitor_exit(void)
     struct monitored_entry *entry, *tmp;
     unsigned long flags;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+    timer_delete_sync(&monitor_timer);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0)
     del_timer_sync(&monitor_timer);
-
-    /* ==============================================================
-     * TODO 6: Free all remaining monitored entries.
-     *
-     * Requirements:
-     *   - remove and free every list node safely
-     *   - leave no leaked state on module unload
-     * ============================================================== */
+#else
+    del_timer(&monitor_timer);
+#endif
 
     spin_lock_irqsave(&monitored_lock, flags);
     list_for_each_entry_safe(entry, tmp, &monitored_entries, link) {
